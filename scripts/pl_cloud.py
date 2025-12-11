@@ -1,3 +1,5 @@
+import json
+import os
 import time
 
 import polars as pl
@@ -26,12 +28,14 @@ from queries.polars.q20 import q as q20
 from queries.polars.q21 import q as q21
 from queries.polars.q22 import q as q22
 
-pc.authenticate()
+PDSH_BUCKET = os.path.normpath(os.environ.get("PDSH_BUCKET", "polars-pdsh/scale-1000.0/200"))
+STORAGE_OPTIONS = json.loads(os.environ.get("STORAGE_OPTIONS", "{}"))
+PC_CLUSTER_CONTEXT = os.environ.get("PC_CLUSTER_CONTEXT", 0)
 
 
 def _scan_ds(table_name: str) -> pl.LazyFrame:
-    path = f"s3://polars-pdsh/scale-factor-1000.0/200/{table_name}/"
-    return pl.scan_parquet(path)
+    path = f"s3://{PDSH_BUCKET}/{table_name}/"
+    return pl.scan_parquet(path, storage_options=STORAGE_OPTIONS)
 
 
 lineitem = _scan_ds("lineitem")
@@ -80,12 +84,30 @@ queries = [
 ]
 
 
-ctx = pc.ComputeContext(
-    workspace="polars-ritchie-dev",
-    instance_type="m6i.xlarge",
-    cluster_size=32,
-    storage=128,
-)
+class PatchedContext(pc.ClusterContext):
+    def start(self, *, wait: bool = False) -> None:
+        pass
+
+    def stop(self, *, wait: bool = False) -> None:
+        pass
+
+ctx: PatchedContext | pc.ComputeContext
+if PC_CLUSTER_CONTEXT:
+    ctx = PatchedContext(
+        compute_address=os.environ.get("PC_SCHEDULER_ADDRESS", "localhost"),
+        compute_port=int(os.environ.get("PC_SCHEDULER_PORT", 5051)),
+        insecure=bool(os.environ.get("PC_SCHEDULER_INSECURE", "1") == "1")
+    )
+else:
+    pc.authenticate()
+
+    ctx = pc.ComputeContext(
+        workspace="polars-ritchie-dev",
+        instance_type="m6i.xlarge",
+        cluster_size=32,
+        storage=128,
+    )
+
 ctx.start(wait=True)
 
 print("started cluster")
@@ -98,7 +120,7 @@ for i, q in enumerate(queries):
     start_time = time.time()
     try:
         result = (
-            q.remote(ctx)
+            q.remote(ctx) # type: ignore[arg-type]
             .distributed(shuffle_compression="zstd")
             .execute()
             .await_result()
